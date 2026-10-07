@@ -5,8 +5,12 @@
 #include "riscv.h"
 #include "defs.h"
 #include "spinlock.h"
+#include "sleeplock.h"
 #include "proc.h"
 #include "fs.h"
+#include "file.h"
+#include "fcntl.h"
+
 
 /*
  * the kernel's page table.
@@ -299,30 +303,40 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
-      continue;   // page table entry hasn't been allocated
+    pte = walk(old, i, 0);
+
+    if(pte == 0)
+      continue;
+
     if((*pte & PTE_V) == 0)
-      continue;   // physical page hasn't been allocated
+      continue;
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+    if(flags & PTE_W){
+  flags &= ~PTE_W;
+  flags |= PTE_COW;
+  *pte = PA2PTE(pa) | flags;
+  sfence_vma();
+}
+
+    krefinc((void *)pa);
+
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      kfree((void *)pa);
       goto err;
     }
   }
+
   return 0;
 
- err:
+err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
-
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
 void
@@ -344,36 +358,68 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
   pte_t *pte;
+  uint64 newpa;
+  uint64 oldpa;
+  uint flags;
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
     if(va0 >= MAXVA)
       return -1;
-  
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
-        return -1;
-      }
-    }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
-    if((*pte & PTE_W) == 0)
+
+    if(pte == 0 || (*pte & PTE_V) == 0){
+      pa0 = vmfault(pagetable, va0, 0);
+
+      if(pa0 == 0)
+        return -1;
+
+      pte = walk(pagetable, va0, 0);
+    }
+
+    flags = PTE_FLAGS(*pte);
+
+    if(flags & PTE_COW){
+      oldpa = PTE2PA(*pte);
+
+      newpa = (uint64)kalloc();
+      if(newpa == 0)
+        return -1;
+
+      memmove((void *)newpa, (void *)oldpa, PGSIZE);
+
+      flags &= ~PTE_COW;
+      flags |= PTE_W;
+
+      *pte = PA2PTE(newpa) | flags;
+      sfence_vma();
+      kfree((void *)oldpa);
+
+      pa0 = newpa;
+    }
+    else if((flags & PTE_W) && (flags & PTE_U)){
+      pa0 = PTE2PA(*pte);
+    }
+    else{
       return -1;
-      
+    }
+
     n = PGSIZE - (dstva - va0);
+
     if(n > len)
       n = len;
+
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;
     src += n;
     dstva = va0 + PGSIZE;
   }
+
   return 0;
 }
-
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
@@ -453,22 +499,143 @@ uint64
 vmfault(pagetable_t pagetable, uint64 va, int read)
 {
   uint64 mem;
+  uint64 oldpa;
+  uint64 fileoff;
+  uint64 n;
+  pte_t *pte;
+  uint flags;
   struct proc *p = myproc();
+  struct vma *v = 0;
 
-  if (va >= p->sz)
-    return 0;
   va = PGROUNDDOWN(va);
-  if(ismapped(pagetable, va)) {
+
+  for(int i = 0; i < MAXVMA; i++){
+    if(p->vmas[i].used &&
+       va >= p->vmas[i].addr &&
+       va < p->vmas[i].addr + p->vmas[i].len){
+      v = &p->vmas[i];
+      break;
+    }
+  }
+
+  if(v){
+    if(read && !(v->prot & PROT_READ))
+      return 0;
+
+    if(!read && !(v->prot & PROT_WRITE))
+      return 0;
+
+    pte = walk(pagetable, va, 0);
+
+    if(pte && (*pte & PTE_V)){
+      flags = PTE_FLAGS(*pte);
+
+      if(!read && (flags & PTE_COW)){
+        oldpa = PTE2PA(*pte);
+
+        mem = (uint64)kalloc();
+        if(mem == 0)
+          return 0;
+
+        memmove((void *)mem, (void *)oldpa, PGSIZE);
+
+        flags &= ~PTE_COW;
+        flags |= PTE_W;
+
+        *pte = PA2PTE(mem) | flags;
+
+        kfree((void *)oldpa);
+
+        return mem;
+      }
+
+      return PTE2PA(*pte);
+    }
+
+    mem = (uint64)kalloc();
+    if(mem == 0)
+      return 0;
+
+    memset((void *)mem, 0, PGSIZE);
+
+    fileoff = v->offset + (va - v->addr);
+
+    ilock(v->file->ip);
+
+    if(fileoff < v->file->ip->size){
+      n = v->file->ip->size - fileoff;
+
+      if(n > PGSIZE)
+        n = PGSIZE;
+
+      if(readi(v->file->ip, 0, mem, fileoff, n) != n){
+        iunlock(v->file->ip);
+        kfree((void *)mem);
+        return 0;
+      }
+    }
+
+    iunlock(v->file->ip);
+
+    flags = PTE_U;
+
+    if(v->prot & PROT_READ)
+      flags |= PTE_R;
+
+    if(v->prot & PROT_WRITE)
+      flags |= PTE_W;
+
+    if(mappages(pagetable, va, PGSIZE, mem, flags) != 0){
+      kfree((void *)mem);
+      return 0;
+    }
+
+    return mem;
+  }
+
+  if(va >= p->sz)
+    return 0;
+
+  pte = walk(pagetable, va, 0);
+
+  if(pte && (*pte & PTE_V)){
+    flags = PTE_FLAGS(*pte);
+
+    if(read == 0 && (flags & PTE_COW)){
+      oldpa = PTE2PA(*pte);
+
+      mem = (uint64)kalloc();
+      if(mem == 0)
+        return 0;
+
+      memmove((void *)mem, (void *)oldpa, PGSIZE);
+
+      flags &= ~PTE_COW;
+      flags |= PTE_W;
+
+      *pte = PA2PTE(mem) | flags;
+
+      kfree((void *)oldpa);
+
+      return mem;
+    }
+
     return 0;
   }
-  mem = (uint64) kalloc();
+
+  mem = (uint64)kalloc();
+
   if(mem == 0)
     return 0;
-  memset((void *) mem, 0, PGSIZE);
-  if (mappages(p->pagetable, va, PGSIZE, mem, PTE_W|PTE_U|PTE_R) != 0) {
+
+  memset((void *)mem, 0, PGSIZE);
+
+  if(mappages(pagetable, va, PGSIZE, mem,
+              PTE_W | PTE_U | PTE_R) != 0){
     kfree((void *)mem);
     return 0;
   }
+
   return mem;
 }
 
@@ -483,4 +650,43 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 1;
   }
   return 0;
+}
+
+void
+vmafork(struct proc *parent, struct proc *child)
+{
+  for(int i = 0; i < MAXVMA; i++){
+    if(parent->vmas[i].used == 0)
+      continue;
+
+    child->vmas[i] = parent->vmas[i];
+    child->vmas[i].file = filedup(parent->vmas[i].file);
+
+    for(uint64 va = parent->vmas[i].addr;
+        va < parent->vmas[i].addr + parent->vmas[i].len;
+        va += PGSIZE){
+
+      pte_t *pte = walk(parent->pagetable, va, 0);
+
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        continue;
+
+      uint64 pa = PTE2PA(*pte);
+      uint flags = PTE_FLAGS(*pte);
+
+      krefinc((void *)pa);
+
+      if(parent->vmas[i].flags == MAP_PRIVATE &&
+         (flags & PTE_W)){
+        flags &= ~PTE_W;
+        flags |= PTE_COW;
+        *pte = PA2PTE(pa) | flags;
+      }
+
+      if(mappages(child->pagetable, va, PGSIZE, pa, flags) != 0){
+        kfree((void *)pa);
+        return;
+      }
+    }
+  }
 }

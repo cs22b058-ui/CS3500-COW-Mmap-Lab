@@ -158,8 +158,25 @@ freeproc(struct proc *p)
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
-  if(p->pagetable)
-    proc_freepagetable(p->pagetable, p->sz);
+  if(p->pagetable){
+  for(int i = 0; i < MAXVMA; i++){
+    if(p->vmas[i].used){
+      for(uint64 va = p->vmas[i].addr;
+          va < p->vmas[i].addr + p->vmas[i].len;
+          va += PGSIZE){
+        pte_t *pte = walk(p->pagetable, va, 0);
+
+        if(pte && (*pte & PTE_V))
+          uvmunmap(p->pagetable, va, 1, 1);
+      }
+
+      fileclose(p->vmas[i].file);
+      p->vmas[i].used = 0;
+    }
+  }
+
+  proc_freepagetable(p->pagetable, p->sz);
+}
   p->pagetable = 0;
   p->sz = 0;
   p->pid = 0;
@@ -272,6 +289,8 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+  
+  vmafork(p, np);
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -391,8 +410,8 @@ kwait(uint64 addr)
             release(&wait_lock);
             return -1;
           }
-          freeproc(pp);
           release(&pp->lock);
+          freeproc(pp);
           release(&wait_lock);
           return pid;
         }

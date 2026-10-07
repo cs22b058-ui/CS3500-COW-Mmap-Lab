@@ -1,0 +1,12 @@
+Sources consulted:
+
+1. CS3500 Operating Systems Lab – xv6 COW and Memory Mapping lab handout.
+2. MIT 6.1810 xv6 Copy-on-Write Fork and mmap lab materials referenced in the lab handout.
+3. Provided xv6 source code, test cases, and grading scripts.
+
+Collaboration:
+I did not collaborate with any other students on this assignment.
+
+Generative AI usage:
+I used AI assistance for understanding some concepts related to Copy-on-Write, page faults, memory mapping, and for debugging a few issues encountered while testing the implementation.
+ The AI was used as a learning and debugging aid, not as a replacement for understanding the lab implementation.
